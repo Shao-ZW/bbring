@@ -5,30 +5,31 @@ use core::cmp::max;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-// BLOCK_NUM and BLOCK_SIZE must be power of 2
+// BLOCK_NUM and SLOT_NUM must be power of 2
 // only implement retry-new mode now
-pub struct RingBuffer<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> {
+pub struct RingBuffer<T, const BLOCK_NUM: usize, const SLOT_NUM: usize> {
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,
-    blocks: [Block<T, BLOCK_SIZE>; BLOCK_NUM],
+    blocks: [Block<T, SLOT_NUM>; BLOCK_NUM],
+
     one_lap: usize,
 }
 
-unsafe impl<T: Send, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> Send
-    for RingBuffer<T, BLOCK_NUM, BLOCK_SIZE>
+unsafe impl<T: Send, const BLOCK_NUM: usize, const SLOT_NUM: usize> Send
+    for RingBuffer<T, BLOCK_NUM, SLOT_NUM>
 {
 }
-unsafe impl<T: Send, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> Sync
-    for RingBuffer<T, BLOCK_NUM, BLOCK_SIZE>
+unsafe impl<T: Send, const BLOCK_NUM: usize, const SLOT_NUM: usize> Sync
+    for RingBuffer<T, BLOCK_NUM, SLOT_NUM>
 {
 }
 
-struct Block<T, const BLOCK_SIZE: usize> {
+struct Block<T, const SLOT_NUM: usize> {
     allocated: CachePadded<AtomicUsize>,
     committed: CachePadded<AtomicUsize>, // Actually counter
     reserved: CachePadded<AtomicUsize>,
     consumed: CachePadded<AtomicUsize>, // Actually counter
-    slots: [UnsafeCell<MaybeUninit<T>>; BLOCK_SIZE],
+    slots: [UnsafeCell<MaybeUninit<T>>; SLOT_NUM],
 
     one_lap: usize,
 }
@@ -56,24 +57,24 @@ enum AdvanceTailReault {
     Success,
 }
 
-impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM, BLOCK_SIZE> {
+impl<T, const BLOCK_NUM: usize, const SLOT_NUM: usize> RingBuffer<T, BLOCK_NUM, SLOT_NUM> {
     pub fn new() -> Self {
         // better error handle
-        if !BLOCK_NUM.is_power_of_two() || !BLOCK_SIZE.is_power_of_two() {
+        if !BLOCK_NUM.is_power_of_two() || !SLOT_NUM.is_power_of_two() {
             panic!("must be power of two")
         }
 
         // may be bug! the overflow of cursor index is a problem
-        let one_lap = max(BLOCK_NUM, BLOCK_SIZE << 1);
+        let one_lap = max(BLOCK_NUM, SLOT_NUM << 1);
 
         Self {
             head: CachePadded::new(AtomicUsize::new(0)),
             tail: CachePadded::new(AtomicUsize::new(0)),
             blocks: core::array::from_fn(|i| {
                 if i == 0 {
-                    Block::<T, BLOCK_SIZE>::new(one_lap, 0)
+                    Block::<T, SLOT_NUM>::new(one_lap, 0)
                 } else {
-                    Block::<T, BLOCK_SIZE>::new(one_lap, BLOCK_SIZE)
+                    Block::<T, SLOT_NUM>::new(one_lap, SLOT_NUM)
                 }
             }),
             one_lap,
@@ -81,11 +82,12 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
     }
 
     pub fn push(&self, mut value: T) -> Result<(), T> {
-        let backoff = Backoff::new();
+        // let backoff = Backoff::new();
 
         loop {
             let head = self.head.load(Ordering::SeqCst);
             let blk_idx = head & (self.one_lap - 1);
+
             match self.blocks[blk_idx].try_commit(value) {
                 CommitResult::Success => return Ok(()),
                 CommitResult::BlockDone(val) => {
@@ -93,7 +95,7 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
                     match self.advance_head(head) {
                         AdvanceHeadResult::NoEntry => return Err(value),
                         AdvanceHeadResult::NotAvaliable => {
-                            backoff.spin();
+                            // backoff.spin();
                             // backoff.snooze();
                         }
                         AdvanceHeadResult::Success => {}
@@ -104,7 +106,8 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
     }
 
     pub fn pop(&self) -> Option<T> {
-        let backoff = Backoff::new();
+        // let backoff = Backoff::new();
+
         loop {
             let tail = self.tail.load(Ordering::SeqCst);
             let blk_idx = tail & (self.one_lap - 1);
@@ -116,7 +119,7 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
                 },
                 ConsumeResult::NoEntry => return None,
                 ConsumeResult::NotAvaliable => {
-                    backoff.spin();
+                    // backoff.spin();
                     // backoff.snooze();
                 }
                 ConsumeResult::Success(val) => return Some(val),
@@ -137,7 +140,7 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
     }
 
     pub fn capacity(&self) -> usize {
-        BLOCK_NUM * BLOCK_SIZE
+        BLOCK_NUM * SLOT_NUM
     }
 
     fn advance_head(&self, old_head: usize) -> AdvanceHeadResult {
@@ -150,8 +153,8 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
         let consumed_cnt = next_blk_consumed & (self.one_lap - 1);
         let consumed_vsn = next_blk_consumed & !(self.one_lap - 1);
 
-        if consumed_vsn < old_head_vsn
-            || (consumed_vsn == old_head_vsn && consumed_cnt != BLOCK_SIZE)
+        // buggy! what if old_head_vsn overflow
+        if consumed_vsn < old_head_vsn || (consumed_vsn == old_head_vsn && consumed_cnt != SLOT_NUM)
         {
             let next_blk_reserved = next_blk.reserved.load(Ordering::SeqCst);
             let reserved_idx = next_blk_reserved & (self.one_lap - 1);
@@ -163,7 +166,6 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
             }
         }
 
-        // sequence matter?
         next_blk
             .committed
             .fetch_max(old_head_vsn.wrapping_add(self.one_lap), Ordering::SeqCst);
@@ -171,7 +173,6 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
             .allocated
             .fetch_max(old_head_vsn.wrapping_add(self.one_lap), Ordering::SeqCst);
 
-        // wow!
         let new_head = if old_blk_idx + 1 < BLOCK_NUM {
             // Same lap, incremented index.
             old_head + 1
@@ -191,7 +192,7 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
         let next_blk_committed = next_blk.committed.load(Ordering::SeqCst);
         let committed_vsn = next_blk_committed & !(self.one_lap - 1);
 
-        if committed_vsn != old_tail_vsn + 1 {
+        if committed_vsn != old_tail_vsn.wrapping_add(self.one_lap) {
             return AdvanceTailReault::NoEntry;
         }
 
@@ -214,7 +215,7 @@ impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> RingBuffer<T, BLOCK_NUM
     }
 }
 
-impl<T, const BLOCK_SIZE: usize> Block<T, BLOCK_SIZE> {
+impl<T, const SLOT_NUM: usize> Block<T, SLOT_NUM> {
     fn new(one_lap: usize, initial: usize) -> Self {
         Self {
             allocated: CachePadded::new(AtomicUsize::new(initial)),
@@ -227,24 +228,71 @@ impl<T, const BLOCK_SIZE: usize> Block<T, BLOCK_SIZE> {
     }
 
     fn try_commit(&self, value: T) -> CommitResult<T> {
-        if self.allocated.load(Ordering::SeqCst) & (self.one_lap - 1) >= BLOCK_SIZE {
-            return CommitResult::BlockDone(value);
-        }
+        // // annoyying part is here
+        // // In fact in retry-new mode you the allocated-version actually not matter
+        // // what need prevent is for example, ringbuffer config is BLOCK_NUM = 4, SLOT_NUM = 2,
+        // // so the one_clp is 4, if 4 threads get this func the same time
 
-        // overflow problem ? won't cause version add?
-        // what if many threads get here and do add?
-        // really bug!!!
-        let old = self.allocated.fetch_add(1, Ordering::SeqCst);
+        // let allocated = self.allocated.load(Ordering::SeqCst);
+        // let committed = self.committed.load(Ordering::SeqCst);
 
-        if old >= BLOCK_SIZE {
-            return CommitResult::BlockDone(value);
-        }
+        // if allocated & (self.one_lap - 1) >= SLOT_NUM {
+        //     return CommitResult::BlockDone(value);
+        // }
 
-        unsafe {
-            self.slots[old].get().write(MaybeUninit::new(value));
+        // let allocated_vsn = allocated & !(self.one_lap - 1);
+
+        // let prev_allocated = self.allocated.fetch_add(1, Ordering::SeqCst);
+        // let prev_allocated_idx = prev_allocated & (self.one_lap - 1);
+        // let prev_allocated_vsn = prev_allocated & !(self.one_lap - 1);
+
+        // if prev_allocated_idx >= SLOT_NUM {
+        //     return CommitResult::BlockDone(value);
+        // }
+
+        // // this is also buggy!
+        // // what if the version add 1 and overflow to 0 but better than last version
+        // // Not quite sure about the correctness in this way!!! check and check
+        // if prev_allocated_vsn > allocated_vsn {
+        //     // version need backoff here !!!
+        //     println!("fuck");
+        //     panic!();
+        //     return CommitResult::BlockDone(value);
+        // }
+
+        // unsafe {
+        //     self.slots[prev_allocated_idx]
+        //         .get()
+        //         .write(MaybeUninit::new(value));
+        // }
+
+        // let commm = self.committed.fetch_add(1, Ordering::SeqCst);
+        // println!(
+        //     "try commit {} {} {} {} success old commited {} ",
+        //     self.id, prev_allocated_idx, prev_allocated_vsn, allocated_vsn, commm
+        // );
+        // return CommitResult::Success;
+
+        // Attention!!!
+        // The performace must be worse than FAA but for the correctness i use this first
+        loop {
+            let allocated = self.allocated.load(Ordering::SeqCst);
+            let allocated_idx = allocated & (self.one_lap - 1);
+
+            if allocated_idx >= SLOT_NUM {
+                return CommitResult::BlockDone(value);
+            }
+
+            if self.allocated.fetch_max(allocated + 1, Ordering::SeqCst) == allocated {
+                unsafe {
+                    self.slots[allocated_idx]
+                        .get()
+                        .write(MaybeUninit::new(value));
+                }
+                self.committed.fetch_add(1, Ordering::SeqCst);
+                return CommitResult::Success;
+            }
         }
-        self.committed.fetch_add(1, Ordering::SeqCst);
-        return CommitResult::Success;
     }
 
     fn try_consume(&self) -> ConsumeResult<T> {
@@ -252,7 +300,7 @@ impl<T, const BLOCK_SIZE: usize> Block<T, BLOCK_SIZE> {
             let reserved = self.reserved.load(Ordering::SeqCst);
             let reserved_idx = reserved & (self.one_lap - 1);
 
-            if reserved_idx < BLOCK_SIZE {
+            if reserved_idx < SLOT_NUM {
                 let committed = self.committed.load(Ordering::SeqCst);
                 let committed_cnt = committed & (self.one_lap - 1);
 
@@ -260,7 +308,7 @@ impl<T, const BLOCK_SIZE: usize> Block<T, BLOCK_SIZE> {
                     return ConsumeResult::NoEntry;
                 }
 
-                if committed_cnt != BLOCK_SIZE {
+                if committed_cnt != SLOT_NUM {
                     let allocated = self.allocated.load(Ordering::SeqCst);
                     let allocated_idx = allocated & (self.one_lap - 1);
 
@@ -279,10 +327,4 @@ impl<T, const BLOCK_SIZE: usize> Block<T, BLOCK_SIZE> {
             }
         }
     }
-}
-
-impl<T, const BLOCK_NUM: usize, const BLOCK_SIZE: usize> Drop
-    for RingBuffer<T, BLOCK_NUM, BLOCK_SIZE>
-{
-    fn drop(&mut self) {}
 }
