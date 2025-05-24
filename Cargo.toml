@@ -5,3 +5,11 @@ edition = "2024"
 
 [dependencies]
 crossbeam-utils = "0.8"
+
+[dev-dependencies]
+crossbeam-queue = "0.3"
+criterion = "0.6"
+
+[[bench]]
+name = "benchmark"
+harness = false
